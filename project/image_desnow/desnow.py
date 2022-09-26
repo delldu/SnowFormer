@@ -230,39 +230,6 @@ class Mlp(nn.Module):
         return x
 
 
-class channel_shuffle(nn.Module):
-    def __init__(self, groups=3):
-        super(channel_shuffle, self).__init__()
-        self.groups = groups
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        assert C % self.groups == 0
-        C_per_group = C // self.groups
-        x = x.view(B, self.groups, C_per_group, H, W)
-        x = x.transpose(1, 2).contiguous()
-
-        x = x.view(B, C, H, W)
-        return x
-
-
-class overlapPatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=7, stride=4, in_channels=3, dim=768):
-        super(overlapPatchEmbed, self).__init__()
-
-        patch_size = (patch_size, patch_size)
-
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(
-            in_channels, dim, kernel_size=patch_size, stride=stride, padding=(patch_size[0] // 2, patch_size[1] // 2)
-        )
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        x = self.proj(x)
-        return x
-
-
 class Attention(nn.Module):
     def __init__(self, dim, num_head=8, qkv_bias=False, qk_scale=None, attn_drop=0.0, proj_drop=0.0, sr_ratio=1):
         super().__init__()
@@ -760,7 +727,7 @@ class Transformer_block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
-        ind = x
+        # ind = x
         b, c, h, w = x.shape
         x = self.attn_nn(self.norm1(x).reshape(b, c, h * w).transpose(1, 2), h, w)
         b, c, h, w = x.shape
