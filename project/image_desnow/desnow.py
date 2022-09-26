@@ -13,102 +13,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import init
 
-from einops import rearrange
-import numbers
-
-import functools
-from torch.nn.modules.conv import _ConvNd
+from einops.layers.torch import Rearrange
+from typing import List
 
 import pdb
-
-
-class _routing(nn.Module):
-    def __init__(self, in_channels, num_experts, dropout_rate):
-        super(_routing, self).__init__()
-
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels), nn.LeakyReLU(0.1, True), nn.Linear(in_channels, num_experts)
-        )
-
-    def forward(self, x):
-        x = torch.flatten(x)
-        x = self.dropout(x)
-        x = self.fc(x)
-        return F.sigmoid(x)
-
-
-class CondConv2D(_ConvNd):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        bias=True,
-        padding_mode="zeros",
-        num_experts=3,
-        dropout_rate=0.2,
-    ):
-        kernel_size = (kernel_size, kernel_size)
-        stride = (stride, stride)
-        padding = (padding, padding)
-        dilation = (dilation, dilation)
-        super(CondConv2D, self).__init__(
-            in_channels, out_channels, kernel_size, stride, padding, dilation, False, (0, 0), groups, bias, padding_mode
-        )
-
-        self._avg_pooling = functools.partial(F.adaptive_avg_pool2d, output_size=(1, 1))
-        self._routing_fn = _routing(in_channels, num_experts, dropout_rate)
-
-        self.weight = torch.nn.parameter(torch.Tensor(num_experts, out_channels, in_channels // groups, *kernel_size))
-
-        self.reset_parameters()
-
-    def _conv_forward(self, input, weight):
-        if self.padding_mode != "zeros":
-            return F.conv2d(
-                F.pad(input, self._padding_repeated_twice, mode=self.padding_mode),
-                weight,
-                self.bias,
-                self.stride,
-                (0, 0),
-                self.dilation,
-                self.groups,
-            )
-        return F.conv2d(input, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
-
-    def forward(self, inputs):
-        b, _, _, _ = inputs.size()
-        res = []
-        for input in inputs:
-            input = input.unsqueeze(0)
-            pooled_inputs = self._avg_pooling(input)
-            routing_weights = self._routing_fn(pooled_inputs)
-            kernels = torch.sum(routing_weights[:, None, None, None, None] * self.weight, 0)
-            out = self._conv_forward(input, kernels)
-            res.append(out)
-        return torch.cat(res, dim=0)
-
-
-def to_3d(x):
-    return rearrange(x, "b c h w -> b (h w) c")
-
-
-def to_4d(x, h, w):
-    return rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
 
 
 class BiasFree_LayerNorm(nn.Module):
     def __init__(self, normalized_shape):
         super(BiasFree_LayerNorm, self).__init__()
-        if isinstance(normalized_shape, numbers.Integral):
-            normalized_shape = (normalized_shape,)
+
+        normalized_shape = (normalized_shape,)
         normalized_shape = torch.Size(normalized_shape)
 
         assert len(normalized_shape) == 1
@@ -124,8 +40,8 @@ class BiasFree_LayerNorm(nn.Module):
 class WithBias_LayerNorm(nn.Module):
     def __init__(self, normalized_shape):
         super(WithBias_LayerNorm, self).__init__()
-        if isinstance(normalized_shape, numbers.Integral):
-            normalized_shape = (normalized_shape,)
+
+        normalized_shape = (normalized_shape,)
         normalized_shape = torch.Size(normalized_shape)
 
         assert len(normalized_shape) == 1
@@ -147,10 +63,15 @@ class LayerNorm(nn.Module):
             self.body = BiasFree_LayerNorm(dim)
         else:
             self.body = WithBias_LayerNorm(dim)
+        self.BxCxHxW_BxHWxC = Rearrange("b c h w -> b (h w) c")
+        self.BxHWxC_BxCxHW = Rearrange("b hw c -> b c hw")
 
     def forward(self, x):
         h, w = x.shape[-2:]
-        return to_4d(self.body(to_3d(x)), h, w)
+        x = self.BxCxHxW_BxHWxC(x)
+        B, HW, C = x.shape
+        x = self.BxHWxC_BxCxHW(self.body(x))  # x -- BxCxHW
+        return x.view(B, C, h, w)
 
 
 class Down(nn.Module):
@@ -192,34 +113,16 @@ class UpSample(nn.Module):
         return x
 
 
-class DWconv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DWconv, self).__init__()
-        self.dwconv = nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False, groups=in_channels)
-
-    def forward(self, x):
-        x = self.dwconv(x)
-        return x
-
-
 class ChannelAttention(nn.Module):
-    def __init__(self, chns, factor, dynamic=False):
+    def __init__(self, chns, factor):
         super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        if dynamic == False:
-            self.channel_map = nn.Sequential(
-                nn.Conv2d(chns, chns // factor, 1, 1, 0),
-                nn.LeakyReLU(),
-                nn.Conv2d(chns // factor, chns, 1, 1, 0),
-                nn.Sigmoid(),
-            )
-        else:
-            self.channel_map = nn.Sequential(
-                CondConv2D(chns, chns // factor, 1, 1, 0),
-                nn.LeakyReLU(),
-                CondConv2D(chns // factor, chns, 1, 1, 0),
-                nn.Sigmoid(),
-            )
+        self.channel_map = nn.Sequential(
+            nn.Conv2d(chns, chns // factor, 1, 1, 0),
+            nn.LeakyReLU(),
+            nn.Conv2d(chns // factor, chns, 1, 1, 0),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x):
         avg_pool = self.avg_pool(x)
@@ -227,145 +130,48 @@ class ChannelAttention(nn.Module):
         return x * map
 
 
-class LKA(nn.Module):
-    def __init__(self, dim):
-        super(LKA, self).__init__()
-        self.conv0 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
-        self.act1 = nn.GELU()
-        self.conv_spatial = nn.Conv2d(dim, dim, 7, stride=1, padding=9, groups=dim, dilation=3)
-        self.act2 = nn.GELU()
-        self.conv1 = nn.Conv2d(dim, dim, 1)
-
-    def forward(self, x):
-        u = x.clone()
-        attn = self.conv0(x)
-        attn = self.act1(attn)
-        attn = self.conv_spatial(attn)
-        attn = self.act2(attn)
-        attn = self.conv1(attn)
-
-        return u * attn
-
-
-class LKA_dynamic(nn.Module):
-    def __init__(self, dim):
-        super(LKA_dynamic, self).__init__()
-        self.conv0 = CondConv2D(dim, dim, 5, 1, 2, 1, dim)
-        self.act1 = nn.GELU()
-        self.conv_spatial = CondConv2D(dim, dim, 7, 1, 9, 3, dim)
-        self.act2 = nn.GELU()
-        self.conv1 = nn.Conv2d(dim, dim, 1)
-
-    def forward(self, x):
-        u = x.clone()
-        attn = self.conv0(x)
-        attn = self.act1(attn)
-        attn = self.conv_spatial(attn)
-        attn = self.act2(attn)
-        attn = self.conv1(attn)
-
-        return u * attn
-
-
-class Attention(nn.Module):
-    def __init__(self, d_model, dynamic=True):
-        super(Attention, self).__init__()
-
-        self.conv11 = nn.Conv2d(d_model, d_model, kernel_size=3, stride=1, padding=1, groups=d_model)
-        # self.activation = nn.GELU()
-        if dynamic == True:
-            self.spatial_gating_unit = LKA_dynamic(d_model)
-        else:
-            self.spatial_gating_unit = LKA(d_model)
-        self.conv22 = nn.Conv2d(d_model, d_model, kernel_size=3, stride=1, padding=1, groups=d_model)
-
-    def forward(self, x):
-        x = self.conv11(x)
-        x = self.spatial_gating_unit(x)
-        x = self.conv22(x)
-        return x
-
-
 class ConvBlock(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio, VAN=False, dynamic=False):
+    def __init__(self, inp, oup, stride, expand_ratio):
         super(ConvBlock, self).__init__()
-        self.VAN = VAN
         hidden_dim = round(inp * expand_ratio)
         self.identity = stride == 1 and inp == oup
 
-        if self.VAN == True:
-            if expand_ratio == 1:
-                self.conv = nn.Sequential(
-                    LayerNorm(hidden_dim, "BiasFree"),
-                    Attention(hidden_dim, dynamic=dynamic),
-                )
-            else:
-                self.conv = nn.Sequential(
-                    nn.Conv2d(inp, hidden_dim, 1, 1, 0),
-                    LayerNorm(hidden_dim, "BiasFree"),
-                    Attention(hidden_dim, dynamic=dynamic),
-                    nn.Conv2d(hidden_dim, oup, 1, 1, 0),
-                )
+        if expand_ratio == 1:
+            self.conv = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
+                LayerNorm(hidden_dim, "BiasFree"),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
+                ChannelAttention(hidden_dim, 4),
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0),
+            )
         else:
-            if dynamic == False:
-                if expand_ratio == 1:
-                    self.conv = nn.Sequential(
-                        nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        LayerNorm(hidden_dim, "BiasFree"),
-                        nn.GELU(),
-                        nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        ChannelAttention(hidden_dim, 4, dynamic=dynamic),
-                        nn.Conv2d(hidden_dim, oup, 1, 1, 0),
-                    )
-                else:
-                    self.conv = nn.Sequential(
-                        # pw
-                        nn.Conv2d(inp, hidden_dim, 1, 1, 0),
-                        nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        LayerNorm(hidden_dim, "BiasFree"),
-                        nn.GELU(),
-                        nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        ChannelAttention(hidden_dim, 4, dynamic=dynamic),
-                        nn.Conv2d(hidden_dim, oup, 1, 1, 0),
-                    )
-            else:
-                if expand_ratio == 1:
-                    self.conv = nn.Sequential(
-                        CondConv2D(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        LayerNorm(hidden_dim, "BiasFree"),
-                        nn.GELU(),
-                        CondConv2D(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        ChannelAttention(hidden_dim, 4, dynamic=dynamic),
-                        # pw-linear
-                        nn.Conv2d(hidden_dim, oup, 1, 1, 0),
-                    )
-                else:
-                    self.conv = nn.Sequential(
-                        nn.Conv2d(inp, hidden_dim, 1, 1, 0),
-                        CondConv2D(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        LayerNorm(hidden_dim, "BiasFree"),
-                        nn.GELU(),
-                        CondConv2D(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
-                        ChannelAttention(hidden_dim, 4, dynamic=dynamic),
-                        nn.Conv2d(hidden_dim, oup, 1, 1, 0),
-                    )
+            self.conv = nn.Sequential(
+                # pw
+                nn.Conv2d(inp, hidden_dim, 1, 1, 0),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
+                LayerNorm(hidden_dim, "BiasFree"),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, dilation=1, groups=hidden_dim),
+                ChannelAttention(hidden_dim, 4),
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0),
+            )
 
     def forward(self, x):
-        if self.identity:
-            return x + self.conv(x)
-        else:
-            return self.conv(x)
+        # if self.identity: #  Always True
+        #     return x + self.conv(x)
+        # else:
+        #     return self.conv(x)
+        return x + self.conv(x)
 
 
 class Conv_block(nn.Module):
-    def __init__(self, n, in_channel, out_channele, expand_ratio, VAN=False, dynamic=False):
+    def __init__(self, n, in_channel, out_channele, expand_ratio):
         super(Conv_block, self).__init__()
 
         layers = []
         for i in range(n):
-            layers.append(
-                ConvBlock(in_channel, out_channele, 1 if i == 0 else 1, expand_ratio, VAN=VAN, dynamic=dynamic)
-            )
+            layers.append(ConvBlock(in_channel, out_channele, 1 if i == 0 else 1, expand_ratio))
             in_channel = out_channele
         self.model = nn.Sequential(*layers)
 
@@ -374,27 +180,7 @@ class Conv_block(nn.Module):
         return x
 
 
-def _to_channel_last(x):
-    """
-    Args:
-        x: (B, C, H, W)
-    Returns:
-        x: (B, H, W, C)
-    """
-    return x.permute(0, 2, 3, 1)
-
-
-def _to_channel_first(x):
-    """
-    Args:
-        x: (B, H, W, C)
-    Returns:
-        x: (B, C, H, W)
-    """
-    return x.permute(0, 3, 1, 2)
-
-
-def window_partition(x, window_size):
+def window_partition(x, window_size: int):
     """
     Args:
         x: (B, H, W, C)
@@ -408,7 +194,7 @@ def window_partition(x, window_size):
     return windows
 
 
-def window_reverse(windows, window_size, H, W):
+def window_reverse(windows, window_size: int, H: int, W: int):
     """
     Args:
         windows: local window features (num_windows*B, window_size, window_size, C)
@@ -498,10 +284,14 @@ class Attention(nn.Module):
         if sr_ratio > 1:
             self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
             self.norm = nn.LayerNorm(dim)
+        else:
+            # Support torch.jit.script
+            self.sr = nn.Identity()
+            self.norm = nn.Identity()
+
         self.conv = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
 
-    def forward(self, x, H, W):
-
+    def forward(self, x, H: int, W: int):
         B, N, C = x.shape
         x_conv = self.conv(x.reshape(B, H, W, C).permute(0, 3, 1, 2))
 
@@ -576,7 +366,7 @@ class Scale_aware_Query(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        x = F.upsample(x, (self.window_size, self.window_size), mode="bicubic")
+        x = F.interpolate(x, (self.window_size, self.window_size), mode="bicubic", align_corners=False)
         x = self.globalgen(x)
         B = x.shape[0]
         x = x.reshape(B, 1, self.N, self.num_heads, self.dim_head).permute(0, 1, 3, 2, 4)
@@ -739,8 +529,7 @@ class Context_Interaction_Block(nn.Module):
         attention=LocalContext_Interaction,
         norm_layer=nn.LayerNorm,
     ):
-
-        super().__init__()
+        super(Context_Interaction_Block, self).__init__()
         self.window_size = window_size
         self.norm1 = norm_layer(dim)
 
@@ -776,11 +565,10 @@ class Context_Interaction_Block(nn.Module):
 
 
 class Context_Interaction_layer(nn.Module):
-    def __init__(self, n, latent_dim, in_channel, head, window_size, globalatten=False):
+    def __init__(self, n, latent_dim, in_channel, head, window_size):
         super(Context_Interaction_layer, self).__init__()
 
         # layers=[]
-        self.globalatten = globalatten
         self.model = nn.ModuleList(
             [
                 Context_Interaction_Block(
@@ -788,32 +576,21 @@ class Context_Interaction_layer(nn.Module):
                     in_channel,
                     num_heads=head,
                     window_size=window_size,
-                    attention=GlobalContext_Interaction
-                    if i % 2 == 1 and self.globalatten == True
-                    else LocalContext_Interaction,
+                    attention=GlobalContext_Interaction if i % 2 == 1 else LocalContext_Interaction,
                 )
                 for i in range(n)
             ]
         )
 
-        if self.globalatten == True:
-            self.gen = Scale_aware_Query(latent_dim, in_channel, window_size=8, num_heads=head)
+        self.gen = Scale_aware_Query(latent_dim, in_channel, window_size=8, num_heads=head)
+        self.BxCxHxW_BxHxWxC = Rearrange("B C H W -> B H W C")
 
     def forward(self, x, latent):
-        if self.globalatten == True:
-            q_global = self.gen(latent)
-            x = _to_channel_last(x)
-            for model in self.model:
-                x = model(x, q_global)
-        else:
-            x = _to_channel_last(x)
-            for model in self.model:
-                x = model(x, 1)
+        q_global = self.gen(latent)
+        x = self.BxCxHxW_BxHxWxC(x)
+        for model in self.model:
+            x = model(x, q_global)
         return x
-
-
-def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
-    return nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size // 2), bias=bias, stride=stride)
 
 
 ##########################################################################
@@ -927,7 +704,7 @@ class HFPH(nn.Module):
             layer3.append(SALayer(fusion_dim, 16))
         self.conv_enc3 = nn.Sequential(*layer3)
 
-    def forward(self, x, encoder_outs, decoder_outs):
+    def forward(self, x, encoder_outs: List[torch.Tensor], decoder_outs: List[torch.Tensor]):
         x = x + self.conv_enc0(encoder_outs[0] + decoder_outs[3])
         x = self.refine0(x)
 
@@ -985,7 +762,6 @@ class Transformer_block(nn.Module):
     def forward(self, x):
         ind = x
         b, c, h, w = x.shape
-        b, c, h, w = x.shape
         x = self.attn_nn(self.norm1(x).reshape(b, c, h * w).transpose(1, 2), h, w)
         b, c, h, w = x.shape
         x = self.drop_path(x)
@@ -1016,37 +792,25 @@ class Transformer(nn.Module):
         sr=1,
         conv_num=[4, 6, 7, 8],
         expand_ratio=[1, 2, 2, 2],
-        VAN=False,
-        dynamic_e=False,
-        dynamic_d=False,
-        global_atten=True,
     ):
         super(Transformer, self).__init__()
         self.patch_size = patch_size
 
         self.embed = Down(in_channels, dim[0], 3, 1, 1)
         self.conv0 = nn.Conv2d(dim[0], dim[4], 1)
-        self.encoder_level0 = nn.Sequential(
-            Conv_block(conv_num[0], dim[0], dim[0], expand_ratio=expand_ratio[0], VAN=VAN, dynamic=dynamic_e)
-        )
+        self.encoder_level0 = nn.Sequential(Conv_block(conv_num[0], dim[0], dim[0], expand_ratio=expand_ratio[0]))
 
         self.down0 = Down(dim[0], dim[1], 3, 2, 1)  ## H//2,W//2
         self.conv1 = nn.Conv2d(dim[1], dim[4], 1)
-        self.encoder_level1 = nn.Sequential(
-            Conv_block(conv_num[1], dim[1], dim[1], expand_ratio=expand_ratio[1], VAN=VAN, dynamic=dynamic_e)
-        )
+        self.encoder_level1 = nn.Sequential(Conv_block(conv_num[1], dim[1], dim[1], expand_ratio=expand_ratio[1]))
 
         self.down1 = Down(dim[1], dim[2], 3, 2, 1)  ## H//4,W//4
         self.conv2 = nn.Conv2d(dim[2], dim[4], 1)
-        self.encoder_level2 = nn.Sequential(
-            Conv_block(conv_num[2], dim[2], dim[2], expand_ratio=expand_ratio[2], VAN=VAN, dynamic=dynamic_e)
-        )
+        self.encoder_level2 = nn.Sequential(Conv_block(conv_num[2], dim[2], dim[2], expand_ratio=expand_ratio[2]))
 
         self.down2 = Down(dim[2], dim[3], 3, 2, 1)  ## H//8,W//8
         self.conv3 = nn.Conv2d(dim[3], dim[4], 1)
-        self.encoder_level3 = nn.Sequential(
-            Conv_block(conv_num[3], dim[3], dim[3], expand_ratio=expand_ratio[3], VAN=VAN, dynamic=dynamic_e)
-        )
+        self.encoder_level3 = nn.Sequential(Conv_block(conv_num[3], dim[3], dim[3], expand_ratio=expand_ratio[3]))
 
         self.down3 = Down(dim[3], dim[4], 3, 2, 1)  ## H//16,W//16
 
@@ -1079,7 +843,6 @@ class Transformer(nn.Module):
             in_channel=dim[3],
             head=head[3],
             window_size=window_size[3],
-            globalatten=global_atten,
         )
         self.up2 = Up(dim[3], dim[2], 4, 2, 1)
         self.ca2 = CALayer(dim[2] * 2, reduction=4)
@@ -1090,7 +853,6 @@ class Transformer(nn.Module):
             in_channel=dim[2],
             head=head[2],
             window_size=window_size[2],
-            globalatten=global_atten,
         )
 
         self.up1 = Up(dim[2], dim[1], 4, 2, 1)
@@ -1102,7 +864,6 @@ class Transformer(nn.Module):
             in_channel=dim[1],
             head=head[1],
             window_size=window_size[1],
-            globalatten=global_atten,
         )
 
         self.up0 = Up(dim[1], dim[0], 4, 2, 1)
@@ -1114,7 +875,6 @@ class Transformer(nn.Module):
             in_channel=dim[0],
             head=head[0],
             window_size=window_size[0],
-            globalatten=global_atten,
         )
 
         self.refinement = HFPH(
@@ -1122,6 +882,7 @@ class Transformer(nn.Module):
         )
 
         self.out2 = nn.Conv2d(dim[0], out_cahnnels, kernel_size=3, stride=1, padding=1)
+        self.BxHxWxC_BxCxHxW = Rearrange("B H W C -> B C H W")
 
     def check_image_size(self, x):
         _, _, h, w = x.size()
@@ -1161,40 +922,48 @@ class Transformer(nn.Module):
         latent = self.latent(latent)
 
         inp_dec_level3 = self.up3(latent)
-        inp_dec_level3 = F.upsample(inp_dec_level3, (inp_enc_level3.shape[2], inp_enc_level3.shape[3]), mode="bicubic")
+        inp_dec_level3 = F.interpolate(
+            inp_dec_level3, (inp_enc_level3.shape[2], inp_enc_level3.shape[3]), mode="bicubic", align_corners=False
+        )
         inp_dec_level3 = torch.cat([inp_dec_level3, inp_enc_level3], 1)
         inp_dec_level3 = self.ca3(inp_dec_level3)
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
 
         out_dec_level3 = self.decoder_level3(inp_dec_level3, latent)
-        out_dec_level3 = _to_channel_first(out_dec_level3)
+        out_dec_level3 = self.BxHxWxC_BxCxHxW(out_dec_level3)
         decoder_item.append(out_dec_level3)
 
         inp_dec_level2 = self.up2(out_dec_level3)
-        inp_dec_level2 = F.upsample(inp_dec_level2, (inp_enc_level2.shape[2], inp_enc_level2.shape[3]), mode="bicubic")
+        inp_dec_level2 = F.interpolate(
+            inp_dec_level2, (inp_enc_level2.shape[2], inp_enc_level2.shape[3]), mode="bicubic", align_corners=False
+        )
         inp_dec_level2 = torch.cat([inp_dec_level2, inp_enc_level2], 1)
         inp_dec_level2 = self.ca2(inp_dec_level2)
         inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
         out_dec_level2 = self.decoder_level2(inp_dec_level2, latent)
-        out_dec_level2 = _to_channel_first(out_dec_level2)
+        out_dec_level2 = self.BxHxWxC_BxCxHxW(out_dec_level2)
         decoder_item.append(out_dec_level2)
 
         inp_dec_level1 = self.up1(out_dec_level2)
-        inp_dec_level1 = F.upsample(inp_dec_level1, (inp_enc_level1.shape[2], inp_enc_level1.shape[3]), mode="bicubic")
+        inp_dec_level1 = F.interpolate(
+            inp_dec_level1, (inp_enc_level1.shape[2], inp_enc_level1.shape[3]), mode="bicubic", align_corners=False
+        )
         inp_dec_level1 = torch.cat([inp_dec_level1, inp_enc_level1], 1)
         inp_dec_level1 = self.ca1(inp_dec_level1)
         inp_dec_level1 = self.reduce_chan_level1(inp_dec_level1)
         out_dec_level1 = self.decoder_level1(inp_dec_level1, latent)
-        out_dec_level1 = _to_channel_first(out_dec_level1)
+        out_dec_level1 = self.BxHxWxC_BxCxHxW(out_dec_level1)
         decoder_item.append(out_dec_level1)
 
         inp_dec_level0 = self.up0(out_dec_level1)
-        inp_dec_level0 = F.upsample(inp_dec_level0, (inp_enc_level0.shape[2], inp_enc_level0.shape[3]), mode="bicubic")
+        inp_dec_level0 = F.interpolate(
+            inp_dec_level0, (inp_enc_level0.shape[2], inp_enc_level0.shape[3]), mode="bicubic", align_corners=False
+        )
         inp_dec_level0 = torch.cat([inp_dec_level0, inp_enc_level0], 1)
         inp_dec_level0 = self.ca0(inp_dec_level0)
         inp_dec_level0 = self.reduce_chan_level0(inp_dec_level0)
         out_dec_level0 = self.decoder_level0(inp_dec_level0, latent)
-        out_dec_level0 = _to_channel_first(out_dec_level0)
+        out_dec_level0 = self.BxHxWxC_BxCxHxW(out_dec_level0)
         decoder_item.append(out_dec_level0)
 
         out_dec_level0_refine = self.refinement(out_dec_level0, encoder_item, decoder_item)

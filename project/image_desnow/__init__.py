@@ -38,10 +38,11 @@ def get_model():
     model = model.to(device)
     model.eval()
 
-    # todos.data.mkdir("output")
-    # if not os.path.exists("output/image_desnow.torch"):
-    #     model = torch.jit.script(model)
-    #     model.save("output/image_desnow.torch")
+    model = torch.jit.script(model)
+
+    todos.data.mkdir("output")
+    if not os.path.exists("output/image_desnow.torch"):
+        model.save("output/image_desnow.torch")
 
     print(f"Running on {device} ...")
 
@@ -53,7 +54,12 @@ def model_forward(model, device, input_tensor, multi_times):
     H, W = input_tensor.size(2), input_tensor.size(3)
     if H % multi_times != 0 or W % multi_times != 0:
         input_tensor = todos.data.zeropad_tensor(input_tensor, times=multi_times)
-    output_tensor = todos.model.forward(model, device, input_tensor)
+
+    torch.cuda.synchronize()
+    with torch.jit.optimized_execution(False):
+        output_tensor = todos.model.forward(model, device, input_tensor)
+    torch.cuda.synchronize()
+
     return output_tensor[:, :, 0:H, 0:W]
 
 
